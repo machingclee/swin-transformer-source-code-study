@@ -36,7 +36,7 @@ def window_partition(x, window_size):
     Returns:
         windows: (num_windows*B, window_size, window_size, C)
     """
-    B, C, H, W = x.shape
+    B, H, W, C = x.shape
     x = x.view(B, H // window_size, window_size, W // window_size, window_size, C)
     windows = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(-1, window_size, window_size, C)
     # windows = rearrange(
@@ -95,18 +95,18 @@ class PatchEmbedding(nn.Module):
         return x
         
 class WindowAttention(nn.Module):
-    def __init__(self, dim, window_size, n_heads, qkv_bias=True, attn_drop=0., proj_drop=0.):
+    def __init__(self, dim, window_size, num_heads, qkv_bias=True, attn_drop=0., proj_drop=0.):
         super(WindowAttention, self).__init__()
         h, w = window_size, window_size
-        head_dim = dim // n_heads
+        head_dim = dim // num_heads
         self.relative_position_bias_table = nn.Parameter(
-            torch.zeros((2*h-1) * (2*w-1), n_heads)
+            torch.zeros((2*h-1) * (2*w-1), num_heads)
         ) 
         self.window_size = window_size
         self.scale = head_dim ** -0.5
         coords_h = torch.arange(h)
         coords_w = torch.arange(w)
-        coords_flatten = torch.stack(torch.meshgrid([coords_h, coords_w])).flatten(1)
+        coords_flatten = torch.stack(torch.meshgrid([coords_h, coords_w], indexing="ij")).flatten(1)
         relative_coords = coords_flatten[:, :, None] - coords_flatten[:, None,:]
         relative_coords = relative_coords.permute(1, 2, 0).contiguous()
         relative_coords[:, :, 0] += self.window_size - 1
@@ -118,7 +118,7 @@ class WindowAttention(nn.Module):
         
         # we don't need to learn the indexing
         self.register_buffer("relative_position_index", relative_position_index) 
-        
+        self.num_heads = num_heads
         self.qkv = nn.Linear(dim, dim*3, bias=qkv_bias)
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj = nn.Linear(dim, dim)
@@ -128,43 +128,42 @@ class WindowAttention(nn.Module):
         self.softmax = nn.Softmax(dim = -1)
         
         
-def forward(self, x, mask=None):
-        """
-        Args:
-            x: input features with shape of (num_windows*B, N, C)
-            mask: (0/-inf) mask with shape of (num_windows, Wh*Ww, Wh*Ww) or None
-        """
-        B_, N, C = x.shape 
-        qkv = self.qkv(x).reshape([B_, N, 3, self.num_heads, C // self.num_heads]).transpose([2, 0, 3, 1, 4])
-        q, k, v = qkv[0], qkv[1], qkv[2]  # make torchscript happy (cannot use tensor as tuple)
+    def forward(self, x, mask=None):
+            """
+            Args:
+                x: input features with shape of (num_windows*B, N, C)
+                mask: (0/-inf) mask with shape of (num_windows, Wh*Ww, Wh*Ww) or None
+            """
+            B_, N, C = x.shape 
+            qkv = self.qkv(x).reshape([B_, N, 3, self.num_heads, C // self.num_heads]).permute(2, 0, 3, 1, 4)
+            q, k, v = qkv[0], qkv[1], qkv[2]  # make torchscript happy (cannot use tensor as tuple)
 
-        q = q * self.scale
-        attn = q @ k.transpose(-2, -1)
+            q = q * self.scale
+            attn = q @ k.transpose(-2, -1)
 
-        relative_position_bias = torch.index_select(
-            self.relative_position_bias_table,
-            self.relative_position_index.reshape((-1,)), 
-            axis=0
-        ).reshape((self.window_size**2, self.window_size**2, -1))
-        
+            relative_position_bias = self.relative_position_bias_table.index_select(
+                0,
+                self.relative_position_index.reshape((-1,))
+            ).reshape((self.window_size**2, self.window_size**2, -1))
+            
 
-        relative_position_bias = relative_position_bias.transpose([2, 0, 1])  # nH, Wh*Ww, Wh*Ww
-        attn = attn + relative_position_bias.unsqueeze(0)
+            relative_position_bias = relative_position_bias.permute(2, 0, 1)  # nH, Wh*Ww, Wh*Ww
+            attn = attn + relative_position_bias.unsqueeze(0)
 
-        if mask is not None:
-            nW = mask.shape[0]
-            attn = attn.reshape([B_ // nW, nW, self.num_heads, N, N]) + mask.unsqueeze(1).unsqueeze(0)
-            attn = attn.reshape([-1, self.num_heads, N, N])
-            attn = self.softmax(attn)
-        else:
-            attn = self.softmax(attn)
+            if mask is not None:
+                nW = mask.shape[0]
+                attn = attn.reshape([B_ // nW, nW, self.num_heads, N, N]) + mask.unsqueeze(1).unsqueeze(0)
+                attn = attn.reshape([-1, self.num_heads, N, N])
+                attn = self.softmax(attn)
+            else:
+                attn = self.softmax(attn)
 
-        attn = self.attn_drop(attn)
+            attn = self.attn_drop(attn)
 
-        x = (attn @ v).transpose(1, 2).reshape([B_, N, C])
-        x = self.proj(x)
-        x = self.proj_drop(x)
-        return x
+            x = (attn @ v).transpose(1, 2).reshape([B_, N, C])
+            x = self.proj(x)
+            x = self.proj_drop(x)
+            return x
 
 class SwinTransformerBlock(nn.Module):
     r""" Swin Transformer Block.
@@ -204,7 +203,7 @@ class SwinTransformerBlock(nn.Module):
 
         self.norm1 = norm_layer(dim)
         self.attn = WindowAttention(
-            dim, window_size=self.window_size, n_heads=num_heads,
+            dim, window_size=self.window_size, num_heads=num_heads,
             qkv_bias=qkv_bias, attn_drop=attn_drop, proj_drop=drop)
 
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
@@ -307,7 +306,7 @@ class PatchMerging(nn.Module):
         super().__init__()
         self.input_resolution = input_resolution
         self.dim = dim
-        self.reduction = nn.Linear(4 * dim, 2 * dim, bias_attr=False)
+        self.reduction = nn.Linear(4 * dim, 2 * dim, bias=False)
         self.norm = norm_layer(4 * dim)
 
     def forward(self, x):
@@ -434,7 +433,7 @@ class SwinTransformer(nn.Module):
         use_checkpoint (bool): Whether to use checkpointing to save memory. Default: False
     """
 
-    def __init__(self, img_size=224, patch_size=4, in_chans=3, num_classes=1000,
+    def __init__(self, img_size=224, patch_size=4, in_chans=3, num_classes=100,
                  embed_dim=96, depths=[2, 2, 6, 2], num_heads=[3, 6, 12, 24],
                  window_size=7, mlp_ratio=4., qkv_bias=True, qk_scale=None,
                  drop_rate=0., attn_drop_rate=0., drop_path_rate=0.1,
@@ -488,10 +487,8 @@ class SwinTransformer(nn.Module):
             self.layers.append(layer)
 
         self.norm = norm_layer(self.num_features)
-        self.avgpool = nn.AdaptiveAvgPool1D(1)
+        self.avgpool = nn.AdaptiveAvgPool1d(1)
         self.head = nn.Linear(self.num_features, num_classes) if num_classes > 0 else nn.Identity()
-
-
 
     def forward_features(self, x):
         x = self.patch_embed(x)
@@ -514,7 +511,7 @@ class SwinTransformer(nn.Module):
 
 
 if __name__ == "__main__":
-    img = torch.rand(1,3,224,224)
+    img = torch.rand(1, 3, 224, 224)
     swin_transformer = SwinTransformer()
     result = swin_transformer(img)
-    print(result)
+    print(result.shape)
